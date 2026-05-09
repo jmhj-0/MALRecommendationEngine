@@ -10,6 +10,7 @@ jobs:
   recommend:
     runs-on: ubuntu-latest
     permissions:
+      contents: write
       issues: write
 
     steps:
@@ -28,6 +29,13 @@ jobs:
           MAL_USERNAME: ${{ secrets.MAL_USERNAME }}
         run: python -m src.main > recommendations.txt 2>&1
 
+      - name: Commit recommendation history
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/history.json
+          git diff --cached --quiet || git commit -m "Update recommendation history" && git push
+
       - name: Create GitHub issue
         env:
           GH_TOKEN: ${{ github.token }}
@@ -39,5 +47,5 @@ jobs:
             echo '```'
           } > issue_body.md
           gh issue create \
-            --title "Weekly Recommendations - $DATE" \
+            --title "MAL Weekly Recommendations - $DATE" \
             --body-file issue_body.md

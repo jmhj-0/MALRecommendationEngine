@@ -22,11 +22,13 @@ _USER_MANGA_FIELDS = (
 )
 _CANDIDATE_ANIME_FIELDS = (
     "genres,studios,mean,media_type,num_scoring_users,"
-    "source,rating,num_episodes,synopsis,start_season"
+    "source,rating,num_episodes,synopsis,start_season,"
+    "status,related_anime"
 )
 _CANDIDATE_MANGA_FIELDS = (
     "genres,mean,media_type,num_scoring_users,"
-    "num_volumes,num_chapters,synopsis"
+    "num_volumes,num_chapters,synopsis,"
+    "status,related_manga"
 )
 
 
@@ -156,3 +158,46 @@ def fetch_manga_candidates(
         "Total unique manga candidates: %d", len(candidates)
     )
     return list(candidates.values())
+
+
+def fetch_collab_ids(
+    client_id: str,
+    media: str,
+    mal_ids: list[int],
+    per_title: int = 10,
+) -> set[int]:
+    """Fetch recommendation IDs for a set of top-rated titles.
+
+    Calls the individual anime/manga detail endpoint for each ID
+    and collects the IDs of recommended titles.
+    """
+    headers = {"X-MAL-CLIENT-ID": client_id}
+    collab: set[int] = set()
+
+    for mid in mal_ids:
+        try:
+            resp = requests.get(
+                f"{_BASE_URL}/{media}/{mid}",
+                headers=headers,
+                params={"fields": "recommendations"},
+                timeout=15,
+            )
+            if resp.status_code != 200:
+                continue
+            for rec in resp.json().get(
+                "recommendations", []
+            )[:per_title]:
+                rid = rec.get("node", {}).get("id")
+                if rid:
+                    collab.add(rid)
+        except requests.RequestException:
+            continue
+        time.sleep(0.3)
+
+    logger.info(
+        "Collected %d collaborative %s IDs from %d titles",
+        len(collab),
+        media,
+        len(mal_ids),
+    )
+    return collab

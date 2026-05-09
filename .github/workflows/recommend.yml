@@ -1,0 +1,43 @@
+name: Weekly Recommendations
+
+on:
+  schedule:
+    # Monday 10:00 BST (09:00 UTC). In winter (GMT) this fires at 09:00 local.
+    - cron: "0 9 * * 1"
+  workflow_dispatch:
+
+jobs:
+  recommend:
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Generate recommendations
+        env:
+          MAL_CLIENT_ID: ${{ secrets.MAL_CLIENT_ID }}
+          MAL_USERNAME: ${{ secrets.MAL_USERNAME }}
+        run: python -m src.main > recommendations.txt 2>&1
+
+      - name: Create GitHub issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          DATE=$(date -u +%Y-%m-%d)
+          {
+            echo '```'
+            cat recommendations.txt
+            echo '```'
+          } > issue_body.md
+          gh issue create \
+            --title "Weekly Recommendations - $DATE" \
+            --body-file issue_body.md

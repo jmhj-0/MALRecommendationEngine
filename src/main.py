@@ -1,5 +1,6 @@
 """MAL Recommendation Engine -- weekly anime and manga picks."""
 
+import argparse
 import json
 import logging
 import os
@@ -10,53 +11,109 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from .mal_client import (
+    CollabData,
+    configure as configure_client,
     fetch_anime_candidates,
-    fetch_collab_ids,
+    fetch_collab_data,
     fetch_manga_candidates,
     fetch_user_anime_list,
     fetch_user_manga_list,
 )
-from .profile import build_profile
+from .profile import (
+    PreferenceProfile,
+    build_profile,
+    build_synopsis_vocab,
+)
 from .recommender import (
+    DEFAULT_WEIGHTS,
     Recommendation,
-    _W_AIRING,
-    _W_COLLAB,
-    _W_GENRE,
-    _W_QUALITY,
-    _W_SOURCE,
-    _W_STUDIO,
-    _W_THEME,
     recommend,
 )
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
+_CONFIG_PATH = _PROJECT_ROOT / "config.json"
 _HISTORY_PATH = _PROJECT_ROOT / "data" / "history.json"
-_HISTORY_WEEKS = 8
+
+
+# ── config ───────────────────────────────────────────────────
+
+def _load_config() -> dict:
+    """Load config.json, falling back to defaults."""
+    defaults = {
+        "top_n": 10,
+        "history_weeks": 8,
+        "candidate_limit": 500,
+        "collab_per_title": 10,
+        "min_scorers": 1000,
+        "genre_cap": 5,
+        "cache_ttl_hours": 6,
+        "weights": dict(DEFAULT_WEIGHTS),
+    }
+    if _CONFIG_PATH.exists():
+        try:
+            user = json.loads(
+                _CONFIG_PATH.read_text(encoding="utf-8")
+            )
+            if "weights" in user:
+                defaults["weights"] = {
+                    **defaults["weights"],
+                    **user["weights"],
+                }
+                del user["weights"]
+            defaults.update(user)
+        except (json.JSONDecodeError, OSError) as exc:
+            logging.warning("Bad config.json, using defaults: %s", exc)
+    return defaults
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="MAL Recommendation Engine"
+    )
+    parser.add_argument(
+        "--top-n",
+        type=int,
+        default=None,
+        help="Number of recommendations per category",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Use cached data only, no API calls",
+    )
+    parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Skip cache, always fetch fresh data",
+    )
+    return parser.parse_args()
 
 
 # ── history ──────────────────────────────────────────────────
 
-def _load_history() -> tuple[set[int], dict]:
-    """Load recent recommendation IDs and the raw history dict."""
+def _load_history(weeks: int) -> tuple[set[int], dict]:
     if not _HISTORY_PATH.exists():
         return set(), {"history": []}
 
-    data = json.loads(_HISTORY_PATH.read_text(encoding="utf-8"))
-    recent_ids: set[int] = set()
-    cutoff = datetime.now() - timedelta(weeks=_HISTORY_WEEKS)
+    try:
+        data = json.loads(
+            _HISTORY_PATH.read_text(encoding="utf-8")
+        )
+    except (json.JSONDecodeError, OSError):
+        logging.warning("Corrupt history.json, starting fresh")
+        return set(), {"history": []}
 
+    recent: set[int] = set()
+    cutoff = datetime.now() - timedelta(weeks=weeks)
     for entry in data.get("history", []):
         try:
-            entry_date = datetime.strptime(
-                entry["date"], "%Y-%m-%d"
-            )
+            d = datetime.strptime(entry["date"], "%Y-%m-%d")
         except (KeyError, ValueError):
             continue
-        if entry_date >= cutoff:
-            recent_ids.update(entry.get("anime_ids", []))
-            recent_ids.update(entry.get("manga_ids", []))
-
-    return recent_ids, data
+        if d >= cutoff:
+            recent.update(entry.get("anime_ids", []))
+            recent.update(entry.get("manga_ids", []))
+    return recent, data
 
 
 def _save_history(
@@ -64,7 +121,6 @@ def _save_history(
     anime_recs: list[Recommendation],
     manga_recs: list[Recommendation],
 ) -> None:
-    """Append today's picks and write the history file."""
     data["history"].append({
         "date": datetime.now().strftime("%Y-%m-%d"),
         "anime_ids": [r.mal_id for r in anime_recs],
@@ -76,39 +132,65 @@ def _save_history(
     )
 
 
-# ── output formatting ───────────────────────────────────────
+# ── output ───────────────────────────────────────────────────
 
-def _print_profile_summary(profile) -> None:
-    """Print top preferences."""
+def _print_profile(profile: PreferenceProfile) -> None:
     print("\n  YOUR TASTE PROFILE")
     print(f"  {'-' * 50}")
 
-    top_genres = sorted(
-        profile.genres.items(), key=lambda x: x[1], reverse=True
-    )
-    loved = [g for g, v in top_genres if v > 0.3][:8]
-    avoided = [g for g, v in top_genres if v < -0.1][:5]
+    loved = [
+        g
+        for g, v in sorted(
+            profile.genres.items(),
+            key=lambda x: x[1],
+            reverse=True,
+        )
+        if v > 0.3
+    ][:8]
+    avoided = [
+        g
+        for g, v in sorted(
+            profile.genres.items(), key=lambda x: x[1]
+        )
+        if v < -0.1
+    ][:5]
     print(f"  Favourite genres  : {', '.join(loved)}")
     if avoided:
         print(f"  Avoided genres    : {', '.join(avoided)}")
 
-    top_themes = sorted(
-        profile.themes.items(), key=lambda x: x[1], reverse=True
-    )
-    liked_themes = [t for t, v in top_themes if v > 0.3][:8]
-    if liked_themes:
-        print(f"  Favourite themes  : {', '.join(liked_themes)}")
-
-    top_studios = sorted(
-        profile.studios.items(),
-        key=lambda x: x[1],
-        reverse=True,
-    )[:5]
-    if top_studios:
-        print(
-            f"  Top studios       : "
-            f"{', '.join(s for s, _ in top_studios)}"
+    themes = [
+        t
+        for t, v in sorted(
+            profile.themes.items(),
+            key=lambda x: x[1],
+            reverse=True,
         )
+        if v > 0.3
+    ][:8]
+    if themes:
+        print(f"  Favourite themes  : {', '.join(themes)}")
+
+    studios = [
+        s
+        for s, _ in sorted(
+            profile.studios.items(),
+            key=lambda x: x[1],
+            reverse=True,
+        )[:5]
+    ]
+    if studios:
+        print(f"  Top studios       : {', '.join(studios)}")
+
+    authors = [
+        a
+        for a, _ in sorted(
+            profile.authors.items(),
+            key=lambda x: x[1],
+            reverse=True,
+        )[:5]
+    ]
+    if authors:
+        print(f"  Top authors       : {', '.join(authors)}")
 
     print(
         f"  Avg anime score   : "
@@ -118,31 +200,43 @@ def _print_profile_summary(profile) -> None:
         f"  Avg manga score   : "
         f"{profile.avg_manga_score:.1f} / 10"
     )
-    print(
-        f"  Collab sources    : "
-        f"{len(profile.top_anime_ids)} anime, "
-        f"{len(profile.top_manga_ids)} manga "
-        f"(scored 9+)"
-    )
+    if profile.dropped_combos:
+        top_combos = sorted(
+            profile.dropped_combos.items(),
+            key=lambda x: x[1],
+            reverse=True,
+        )[:3]
+        combos_str = ", ".join(
+            f"{a}+{b} ({c}x)" for (a, b), c in top_combos
+        )
+        print(f"  Avoided combos    : {combos_str}")
 
 
-def _score_breakdown(rec: Recommendation) -> str:
-    """Compact string showing weighted score components."""
+def _breakdown(rec: Recommendation, w: dict) -> str:
     parts = [
-        f"genre {_W_GENRE * rec.genre_score:+.2f}",
-        f"theme {_W_THEME * rec.theme_score:+.2f}",
-        f"studio {_W_STUDIO * rec.studio_score:+.2f}",
-        f"quality {_W_QUALITY * rec.quality_score:+.2f}",
+        f"genre {w['genre'] * rec.genre_score:+.2f}",
+        f"theme {w['theme'] * rec.theme_score:+.2f}",
+        f"creator {w['creator'] * rec.creator_score:+.2f}",
+        f"quality {w['quality'] * rec.quality_score:+.2f}",
     ]
     if rec.collab_score > 0:
-        parts.append(f"collab +{_W_COLLAB:.2f}")
+        parts.append(
+            f"collab {w['collab'] * rec.collab_score:+.2f}"
+        )
+    if rec.synopsis_score > 0:
+        parts.append(
+            f"synopsis {w['synopsis'] * rec.synopsis_score:+.2f}"
+        )
     if rec.airing_score > 0:
-        parts.append(f"airing +{_W_AIRING:.2f}")
+        parts.append(f"airing +{w['airing']:.2f}")
+    if rec.combo_penalty > 0:
+        parts.append(f"combo -{rec.combo_penalty:.2f}")
     return " | ".join(parts)
 
 
-def _format_rec(rec: Recommendation, rank: int) -> str:
-    """Format a single recommendation for console output."""
+def _format_rec(
+    rec: Recommendation, rank: int, w: dict
+) -> str:
     lines = [
         f"  {rank:>2}. {rec.title}",
         f"      MAL: {rec.mean_score:.2f}  |  "
@@ -162,28 +256,31 @@ def _format_rec(rec: Recommendation, rank: int) -> str:
         )
     if rec.matching_studios:
         reasons.append(
-            f"studio match "
-            f"({', '.join(rec.matching_studios)})"
+            f"studio match ({', '.join(rec.matching_studios)})"
         )
     if rec.collab_score > 0:
-        reasons.append("similar to your 9/10-rated titles")
+        reasons.append("similar to your top-rated titles")
+    if rec.synopsis_score > 0.3:
+        reasons.append("thematically similar")
     if rec.airing_score > 0:
         reasons.append("currently airing")
     if rec.quality_score > 0.5:
         reasons.append("highly rated")
+    if rec.combo_penalty > 0:
+        reasons.append("has a dropped genre combo (penalised)")
     if reasons:
         lines.append(f"      Why: {'; '.join(reasons)}")
 
     lines.append(
         f"      Score: {rec.final_score:.2f} "
-        f"({_score_breakdown(rec)})"
+        f"({_breakdown(rec, w)})"
     )
 
     if rec.synopsis:
-        synopsis = rec.synopsis.rstrip()
-        if len(synopsis) >= 200:
-            synopsis = synopsis[:197] + "..."
-        lines.append(f"      {synopsis}")
+        s = rec.synopsis.rstrip()
+        if len(s) >= 200:
+            s = s[:197] + "..."
+        lines.append(f"      {s}")
     lines.append(f"      {rec.url}")
     return "\n".join(lines)
 
@@ -196,8 +293,13 @@ def main() -> None:
         format="%(asctime)s  %(levelname)s  %(message)s",
     )
 
-    load_dotenv(_PROJECT_ROOT / ".env")
+    args = _parse_args()
+    cfg = _load_config()
 
+    if args.top_n is not None:
+        cfg["top_n"] = args.top_n
+
+    load_dotenv(_PROJECT_ROOT / ".env")
     client_id = os.environ.get("MAL_CLIENT_ID")
     username = os.environ.get("MAL_USERNAME")
     if not client_id or not username:
@@ -206,35 +308,88 @@ def main() -> None:
         )
         sys.exit(1)
 
+    configure_client(
+        cache_ttl_hours=cfg["cache_ttl_hours"],
+        dry_run=args.dry_run,
+        no_cache=args.no_cache,
+    )
+
     # ── fetch user data ──────────────────────────────────────
     anime_list = fetch_user_anime_list(client_id, username)
     manga_list = fetch_user_manga_list(client_id, username)
     profile = build_profile(anime_list, manga_list)
 
-    # ── collaborative filtering ──────────────────────────────
-    if profile.top_anime_ids:
-        profile.collab_anime_ids = fetch_collab_ids(
-            client_id, "anime", profile.top_anime_ids
+    # ── collaborative filtering (graceful degradation) ───────
+    anime_collab = CollabData()
+    manga_collab = CollabData()
+
+    try:
+        if profile.top_anime_ids:
+            anime_collab = fetch_collab_data(
+                client_id,
+                "anime",
+                profile.top_anime_ids,
+                cfg["collab_per_title"],
+            )
+        if profile.top_manga_ids:
+            manga_collab = fetch_collab_data(
+                client_id,
+                "manga",
+                profile.top_manga_ids,
+                cfg["collab_per_title"],
+            )
+    except Exception as exc:
+        logging.warning(
+            "Collaborative filtering failed, continuing "
+            "without it: %s",
+            exc,
         )
-    if profile.top_manga_ids:
-        profile.collab_manga_ids = fetch_collab_ids(
-            client_id, "manga", profile.top_manga_ids
+
+    # Enrich profile with collab data
+    profile.collab_anime_weights = anime_collab.weights
+    profile.collab_manga_weights = manga_collab.weights
+    profile.cross_anime_ids = manga_collab.cross_media_ids
+    profile.cross_manga_ids = anime_collab.cross_media_ids
+
+    all_synopses = anime_collab.synopses + manga_collab.synopses
+    if all_synopses:
+        profile.synopsis_vocab = build_synopsis_vocab(
+            all_synopses
         )
 
     # ── fetch candidates ─────────────────────────────────────
-    anime_candidates = fetch_anime_candidates(client_id)
-    manga_candidates = fetch_manga_candidates(client_id)
+    anime_candidates = fetch_anime_candidates(
+        client_id, cfg["candidate_limit"]
+    )
+    manga_candidates = fetch_manga_candidates(
+        client_id, cfg["candidate_limit"]
+    )
 
-    # ── load history and generate recommendations ────────────
-    history_ids, history_data = _load_history()
+    # ── history + recommendations ────────────────────────────
+    history_ids, history_data = _load_history(
+        cfg["history_weeks"]
+    )
+    w = cfg["weights"]
 
     anime_recs = recommend(
-        anime_candidates, profile, "anime",
+        anime_candidates,
+        profile,
+        "anime",
+        top_n=cfg["top_n"],
         history_ids=history_ids,
+        weights=w,
+        genre_cap=cfg["genre_cap"],
+        min_scorers=cfg["min_scorers"],
     )
     manga_recs = recommend(
-        manga_candidates, profile, "manga",
+        manga_candidates,
+        profile,
+        "manga",
+        top_n=cfg["top_n"],
         history_ids=history_ids,
+        weights=w,
+        genre_cap=cfg["genre_cap"],
+        min_scorers=cfg["min_scorers"],
     )
 
     _save_history(history_data, anime_recs, manga_recs)
@@ -251,18 +406,18 @@ def main() -> None:
     )
     print(sep)
 
-    _print_profile_summary(profile)
+    _print_profile(profile)
 
     print(f"\n  ANIME PICKS ({len(anime_recs)})")
     print(f"  {'-' * 50}")
     for i, rec in enumerate(anime_recs, 1):
-        print(_format_rec(rec, i))
+        print(_format_rec(rec, i, w))
         print()
 
     print(f"  MANGA PICKS ({len(manga_recs)})")
     print(f"  {'-' * 50}")
     for i, rec in enumerate(manga_recs, 1):
-        print(_format_rec(rec, i))
+        print(_format_rec(rec, i, w))
         print()
 
     print(sep)

@@ -1,0 +1,20 @@
+{
+  "top_n": 10,
+  "history_weeks": 8,
+  "candidate_limit": 500,
+  "collab_per_title": 10,
+  "min_scorers": 1000,
+  "genre_cap": 5,
+  "cache_ttl_hours": 6,
+  "weights": {
+    "genre": 0.20,
+    "theme": 0.08,
+    "creator": 0.10,
+    "source": 0.04,
+    "quality": 0.30,
+    "collab": 0.12,
+    "synopsis": 0.06,
+    "airing": 0.05,
+    "novelty": 0.05
+  }
+}

@@ -1,8 +1,11 @@
 """Build a weighted preference profile from MAL history."""
 
 import logging
+import re
 from collections import defaultdict
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from itertools import combinations
 
 logger = logging.getLogger(__name__)
 
@@ -16,6 +19,49 @@ DEMOGRAPHICS = frozenset({
     "Shounen", "Shoujo", "Seinen", "Josei", "Kids",
 })
 
+_STOPWORDS = frozenset({
+    "a", "an", "the", "and", "or", "but", "in", "on", "at",
+    "to", "for", "of", "with", "by", "from", "as", "is", "was",
+    "are", "were", "been", "be", "have", "has", "had", "do",
+    "does", "did", "will", "would", "could", "should", "may",
+    "might", "can", "not", "it", "its", "he", "she", "they",
+    "them", "their", "his", "her", "him", "this", "that",
+    "these", "those", "who", "whom", "which", "what", "where",
+    "when", "how", "all", "each", "every", "both", "few",
+    "more", "most", "other", "some", "such", "no", "nor",
+    "only", "own", "same", "so", "than", "too", "very",
+    "just", "because", "about", "into", "through", "during",
+    "before", "after", "above", "below", "between", "under",
+    "again", "further", "then", "once", "here", "there",
+    "also", "however", "one", "two", "new", "first", "last",
+    "long", "great", "over", "still", "even", "being",
+    "while", "many", "much", "your", "you", "out", "up",
+    "down", "off", "away", "back", "now", "get", "got",
+    "make", "made", "take", "come", "see", "know", "say",
+    "said", "tell", "told", "find", "give", "think", "want",
+    "use", "way", "like", "well", "day", "time", "look",
+    "upon", "yet", "must", "shall", "though", "since",
+    "until", "another", "any", "our", "we", "my", "me",
+})
+
+
+# ── time decay ───────────────────────────────────────────────
+
+def _time_decay(updated_at: str | None) -> float:
+    """Return a multiplier between 0.5 and 1.0 based on recency."""
+    if not updated_at:
+        return 0.75
+    try:
+        ts = datetime.fromisoformat(
+            updated_at.replace("Z", "+00:00")
+        )
+        days = (datetime.now(timezone.utc) - ts).days
+        return max(0.5, 1.0 - (days / 1460) * 0.5)  # 4-year half-life
+    except (ValueError, TypeError):
+        return 0.75
+
+
+# ── status weight ────────────────────────────────────────────
 
 def _status_weight(
     status: str,
@@ -25,12 +71,7 @@ def _status_weight(
     chapters_read: int = 0,
     total_chapters: int = 0,
 ) -> float:
-    """Return a preference weight from list status and score.
-
-    Dropped titles use a proportional penalty: dropping after
-    watching most of a show is a stronger negative signal than
-    dropping after one episode.
-    """
+    """Return a preference weight from list status and score."""
     if status == "dropped":
         watched = episodes_watched or chapters_read
         total = total_episodes or total_chapters
@@ -48,21 +89,65 @@ def _status_weight(
 
 
 def _classify(name: str) -> str:
-    """Classify a MAL genre/theme/demographic tag."""
-    if name in DEMOGRAPHICS:
-        return "genre"  # treat demographics like broad genres
-    if name in BROAD_GENRES:
+    if name in DEMOGRAPHICS or name in BROAD_GENRES:
         return "genre"
     return "theme"
 
 
+def _author_name(author: dict) -> str:
+    first = author.get("first_name", "")
+    last = author.get("last_name", "")
+    return f"{first} {last}".strip()
+
+
+# ── synopsis keyword analysis ────────────────────────────────
+
+def _tokenize(text: str) -> list[str]:
+    text = re.sub(r"[^\w\s]", " ", text.lower())
+    return [
+        w for w in text.split()
+        if len(w) > 2 and w not in _STOPWORDS
+    ]
+
+
+def build_synopsis_vocab(
+    synopses: list[str], min_count: int = 3
+) -> set[str]:
+    """Build taste vocabulary from synopses of top-rated titles."""
+    doc_freq: dict[str, int] = defaultdict(int)
+    for synopsis in synopses:
+        for word in set(_tokenize(synopsis)):
+            doc_freq[word] += 1
+    vocab = {w for w, c in doc_freq.items() if c >= min_count}
+    logger.info(
+        "Synopsis vocab: %d words from %d synopses",
+        len(vocab),
+        len(synopses),
+    )
+    return vocab
+
+
+def synopsis_similarity(
+    synopsis: str, vocab: set[str]
+) -> float:
+    """Score a candidate synopsis against the taste vocabulary."""
+    if not vocab or not synopsis:
+        return 0.0
+    words = set(_tokenize(synopsis))
+    if not words:
+        return 0.0
+    overlap = len(words & vocab)
+    return min(1.0, overlap / 8.0)
+
+
+# ── profile dataclass ────────────────────────────────────────
+
 @dataclass
 class PreferenceProfile:
-    """Normalised preference scores across dimensions."""
-
     genres: dict[str, float] = field(default_factory=dict)
     themes: dict[str, float] = field(default_factory=dict)
     studios: dict[str, float] = field(default_factory=dict)
+    authors: dict[str, float] = field(default_factory=dict)
     sources: dict[str, float] = field(default_factory=dict)
 
     known_anime_ids: set[int] = field(default_factory=set)
@@ -73,15 +158,26 @@ class PreferenceProfile:
     top_anime_ids: list[int] = field(default_factory=list)
     top_manga_ids: list[int] = field(default_factory=list)
 
-    collab_anime_ids: set[int] = field(default_factory=set)
-    collab_manga_ids: set[int] = field(default_factory=set)
+    dropped_combos: dict[tuple[str, str], int] = field(
+        default_factory=dict
+    )
+
+    # Set after initial build via collab fetch
+    collab_anime_weights: dict[int, float] = field(
+        default_factory=dict
+    )
+    collab_manga_weights: dict[int, float] = field(
+        default_factory=dict
+    )
+    cross_anime_ids: set[int] = field(default_factory=set)
+    cross_manga_ids: set[int] = field(default_factory=set)
+    synopsis_vocab: set[str] = field(default_factory=set)
 
     avg_anime_score: float = 0.0
     avg_manga_score: float = 0.0
 
 
 def _normalise(prefs: dict[str, float]) -> dict[str, float]:
-    """Scale values into the [-1, 1] range."""
     if not prefs:
         return prefs
     peak = max(abs(v) for v in prefs.values())
@@ -90,15 +186,18 @@ def _normalise(prefs: dict[str, float]) -> dict[str, float]:
     return {k: v / peak for k, v in prefs.items()}
 
 
+# ── profile builder ──────────────────────────────────────────
+
 def build_profile(
     anime_list: list[dict],
     manga_list: list[dict],
 ) -> PreferenceProfile:
-    """Analyse both lists and return a PreferenceProfile."""
     genre_acc: dict[str, float] = defaultdict(float)
     theme_acc: dict[str, float] = defaultdict(float)
     studio_acc: dict[str, float] = defaultdict(float)
+    author_acc: dict[str, float] = defaultdict(float)
     source_acc: dict[str, float] = defaultdict(float)
+    combo_acc: dict[tuple[str, str], int] = defaultdict(int)
 
     known_anime: set[int] = set()
     known_manga: set[int] = set()
@@ -106,8 +205,8 @@ def build_profile(
     completed_manga: set[int] = set()
     anime_scored: list[tuple[int, int]] = []
     manga_scored: list[tuple[int, int]] = []
-    anime_score_vals: list[int] = []
-    manga_score_vals: list[int] = []
+    anime_vals: list[int] = []
+    manga_vals: list[int] = []
 
     # ── anime ────────────────────────────────────────────────
     for item in anime_list:
@@ -124,16 +223,17 @@ def build_profile(
         w = _status_weight(
             status,
             score,
-            episodes_watched=ls.get(
-                "num_episodes_watched", 0
-            ),
+            episodes_watched=ls.get("num_episodes_watched", 0),
             total_episodes=node.get("num_episodes", 0),
         )
+        decay = _time_decay(ls.get("updated_at"))
+        w *= decay
 
         if score > 0:
             anime_scored.append((mal_id, score))
-            anime_score_vals.append(score)
+            anime_vals.append(score)
 
+        tag_names = [g["name"] for g in node.get("genres", [])]
         for g in node.get("genres", []):
             if _classify(g["name"]) == "genre":
                 genre_acc[g["name"]] += w
@@ -146,6 +246,10 @@ def build_profile(
         src = node.get("source", "")
         if src:
             source_acc[src] += w
+
+        if status == "dropped":
+            for combo in combinations(sorted(tag_names), 2):
+                combo_acc[combo] += 1
 
     # ── manga ────────────────────────────────────────────────
     for item in manga_list:
@@ -165,27 +269,43 @@ def build_profile(
             chapters_read=ls.get("num_chapters_read", 0),
             total_chapters=node.get("num_chapters", 0),
         )
+        decay = _time_decay(ls.get("updated_at"))
+        w *= decay
 
         if score > 0:
             manga_scored.append((mal_id, score))
-            manga_score_vals.append(score)
+            manga_vals.append(score)
 
+        tag_names = [g["name"] for g in node.get("genres", [])]
         for g in node.get("genres", []):
             if _classify(g["name"]) == "genre":
                 genre_acc[g["name"]] += w
             else:
                 theme_acc[g["name"]] += w
 
-    # ── top-rated IDs for collaborative filtering ────────────
+        for a in node.get("authors", []):
+            name = _author_name(a)
+            if name:
+                author_acc[name] += w
+
+        if status == "dropped":
+            for combo in combinations(sorted(tag_names), 2):
+                combo_acc[combo] += 1
+
+    # ── top-rated IDs ────────────────────────────────────────
     anime_scored.sort(key=lambda x: x[1], reverse=True)
     manga_scored.sort(key=lambda x: x[1], reverse=True)
     top_anime = [mid for mid, s in anime_scored if s >= 9][:20]
     top_manga = [mid for mid, s in manga_scored if s >= 9][:20]
 
+    # Only keep combos that appeared 2+ times
+    sig_combos = {k: v for k, v in combo_acc.items() if v >= 2}
+
     profile = PreferenceProfile(
         genres=_normalise(dict(genre_acc)),
         themes=_normalise(dict(theme_acc)),
         studios=_normalise(dict(studio_acc)),
+        authors=_normalise(dict(author_acc)),
         sources=_normalise(dict(source_acc)),
         known_anime_ids=known_anime,
         known_manga_ids=known_manga,
@@ -193,27 +313,24 @@ def build_profile(
         completed_manga_ids=completed_manga,
         top_anime_ids=top_anime,
         top_manga_ids=top_manga,
+        dropped_combos=sig_combos,
         avg_anime_score=(
-            sum(anime_score_vals) / len(anime_score_vals)
-            if anime_score_vals
-            else 0.0
+            sum(anime_vals) / len(anime_vals) if anime_vals else 0.0
         ),
         avg_manga_score=(
-            sum(manga_score_vals) / len(manga_score_vals)
-            if manga_score_vals
-            else 0.0
+            sum(manga_vals) / len(manga_vals) if manga_vals else 0.0
         ),
     )
 
     logger.info(
         "Profile: %d genres, %d themes, %d studios, "
-        "%d completed anime, %d completed manga, "
+        "%d authors, %d dropped combos, "
         "%d top anime, %d top manga",
         len(profile.genres),
         len(profile.themes),
         len(profile.studios),
-        len(profile.completed_anime_ids),
-        len(profile.completed_manga_ids),
+        len(profile.authors),
+        len(profile.dropped_combos),
         len(profile.top_anime_ids),
         len(profile.top_manga_ids),
     )
